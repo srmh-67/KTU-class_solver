@@ -6,10 +6,40 @@ const shifts = [
   { code: "D", label: "D勤務", start: "15:15", end: "16:55" },
   { code: "E", label: "E勤務", start: "17:10", end: "18:50" }
 ];
-const state = { reservations: [], rooms: new Map(), results: [], allResults: [] };
+const state = { reservations: [], rooms: new Map(), results: [], allResults: [], inspectionRooms: new Set(), inspectionOnly: false };
 const $ = (id) => document.getElementById(id);
 const dateInput = $("dateInput");
 dateInput.value = new Date().toISOString().slice(0, 10);
+
+function normalizeRoom(value) {
+  return String(value).normalize("NFKC").trim().toUpperCase();
+}
+async function loadInspectionRooms() {
+  try {
+    const response = await fetch("classrooms.json");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    if (!Array.isArray(data.inspectionRooms)) throw new Error("点検対象教室の形式が不正です");
+    state.inspectionRooms = new Set(data.inspectionRooms.map(normalizeRoom));
+    $("inspectionRoomsButton").disabled = false;
+    $("inspectionStatus").textContent = `点検対象：${state.inspectionRooms.size} 教室（予約データに含まれる教室から絞り込み）`;
+  } catch (error) {
+    $("inspectionStatus").textContent = "点検対象教室を読み込めませんでした。classrooms.jsonを確認し、HTTPサーバー経由でページを開いてください。";
+  }
+}
+function selectedRooms() {
+  return [...state.rooms.values()].filter((room) => !state.inspectionOnly ||
+    state.inspectionRooms.has(normalizeRoom(room.code)) || state.inspectionRooms.has(normalizeRoom(room.name)));
+}
+function setInspectionFilter(inspectionOnly) {
+  state.inspectionOnly = inspectionOnly;
+  $("allRoomsButton").setAttribute("aria-pressed", String(!inspectionOnly));
+  $("inspectionRoomsButton").setAttribute("aria-pressed", String(inspectionOnly));
+  if (!$("results").hidden) renderResults();
+}
+$("allRoomsButton").addEventListener("click", () => setInspectionFilter(false));
+$("inspectionRoomsButton").addEventListener("click", () => setInspectionFilter(true));
+loadInspectionRooms();
 
 function cellValue(row, names) {
   const key = Object.keys(row).find((candidate) => names.some((name) => candidate.replace(/\s/g, "").includes(name)));
@@ -58,7 +88,7 @@ function escapeHtml(value) { return value.replace(/[&<>'"]/g, (char) => ({ "&": 
 function availableRooms(date, startValue, endValue) {
   const start = timeToMinutes(startValue);
   const end = timeToMinutes(endValue);
-  return [...state.rooms.values()]
+  return selectedRooms()
     .filter((room) => !state.reservations.some((reservation) => reservation.code === (room.code || room.name) && reservation.date === date && reservation.start < end && reservation.end > start))
     .sort((left, right) => (left.code || left.name).localeCompare(right.code || right.name, "ja", { numeric: true }));
 }
@@ -72,13 +102,13 @@ function renderResults() {
   state.allResults = shifts.map((item) => ({ ...item, rooms: availableRooms(date, item.start, item.end) }));
   $("results").hidden = false;
   $("resultCount").textContent = `${rooms.length} 教室`;
-  $("resultMeta").textContent = `${date.replaceAll("-", "/")}  ${shift.label}（${startValue} - ${endValue}）の空き状況`;
+  $("resultMeta").textContent = `${date.replaceAll("-", "/")}  ${shift.label}（${startValue} - ${endValue}）の空き状況｜${state.inspectionOnly ? "点検対象教室" : "全教室"}`;
   $("resultBody").innerHTML = rooms.map((room) => `<tr><td>${escapeHtml(room.code || "-")}</td><td><strong>${escapeHtml(room.name || "-")}</strong></td><td>${escapeHtml(room.group)}</td><td>${date.replaceAll("-", "/")}</td><td>${startValue} - ${endValue}</td><td class="available">空き</td></tr>`).join("");
   $("emptyState").hidden = rooms.length > 0;
   $("downloadButton").disabled = rooms.length === 0;
   $("pdfButton").disabled = rooms.length === 0;
-  $("allCsvButton").disabled = state.rooms.size === 0;
-  $("allPdfButton").disabled = state.rooms.size === 0;
+  $("allCsvButton").disabled = selectedRooms().length === 0;
+  $("allPdfButton").disabled = selectedRooms().length === 0;
 }
 function csvDownload(rows, filename) {
   const csv = "\uFEFF" + rows.map((row) => row.map((cell) => `"${String(cell ?? "").replaceAll('"', '""')}"`).join(",")).join("\n");
@@ -108,7 +138,7 @@ function openPrintPage(allShifts) {
   if (allShifts) {
     title = "空き教室一覧（全勤務）";
     headers = ["教室コード", "教室名", "グループ", ...shifts.map((item) => `${item.label} ${item.start}-${item.end}`)];
-    rows = [...state.rooms.values()].sort((left, right) => (left.code || left.name).localeCompare(right.code || right.name, "ja", { numeric: true })).map((room) => [room.code || "-", room.name || "-", room.group, ...state.allResults.map((item) => item.rooms.some((result) => (result.code || result.name) === (room.code || room.name)) ? "空き" : "予約あり")]);
+    rows = selectedRooms().sort((left, right) => (left.code || left.name).localeCompare(right.code || right.name, "ja", { numeric: true })).map((room) => [room.code || "-", room.name || "-", room.group, ...state.allResults.map((item) => item.rooms.some((result) => (result.code || result.name) === (room.code || room.name)) ? "空き" : "予約あり")]);
   } else {
     const shift = shifts.find((item) => item.code === $("shiftSelect").value) || shifts[0];
     title = `空き教室一覧（${shift.label}）`;
@@ -119,5 +149,5 @@ function openPrintPage(allShifts) {
   window.open("print.html", "_blank");
 }
 $("pdfButton").addEventListener("click", () => openPrintPage(false));
-$("allCsvButton").addEventListener("click", () => { const rows = [["教室コード", "教室名", "グループ", ...shifts.map((item) => `${item.label}（${item.start}-${item.end}）`)]]; const roomMap = new Map(state.rooms); [...roomMap.values()].sort((left, right) => (left.code || left.name).localeCompare(right.code || right.name, "ja", { numeric: true })).forEach((room) => rows.push([room.code || "-", room.name || "-", room.group, ...state.allResults.map((item) => item.rooms.some((result) => (result.code || result.name) === (room.code || room.name)) ? "空き" : "予約あり")])); csvDownload(rows, `空き教室_全勤務_${dateInput.value}.csv`); });
+$("allCsvButton").addEventListener("click", () => { const rows = [["教室コード", "教室名", "グループ", ...shifts.map((item) => `${item.label}（${item.start}-${item.end}）`)]]; selectedRooms().sort((left, right) => (left.code || left.name).localeCompare(right.code || right.name, "ja", { numeric: true })).forEach((room) => rows.push([room.code || "-", room.name || "-", room.group, ...state.allResults.map((item) => item.rooms.some((result) => (result.code || result.name) === (room.code || room.name)) ? "空き" : "予約あり")])); csvDownload(rows, `空き教室_全勤務_${dateInput.value}.csv`); });
 $("allPdfButton").addEventListener("click", () => openPrintPage(true));
